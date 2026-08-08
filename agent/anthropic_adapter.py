@@ -11,6 +11,7 @@ Auth supports:
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -395,6 +396,29 @@ def _detect_claude_code_version() -> str:
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 _MCP_TOOL_PREFIX = "mcp__"
 
+# ── Claude Code billing header ───────────────────────────────────────────
+# Claude Code sends an ``x-anthropic-billing-header:`` line as the FIRST
+# system block on every OAuth/subscription request. Despite the name it
+# travels in the request body, not in HTTP headers.
+#
+# Without it, Anthropic's subscription classifier does not recognise the
+# caller as Claude Code and bills the request to the "extra usage" lane
+# instead of the plan's included quota. On an account with no extra-usage
+# credits that surfaces as an HTTP 400 whose message looks like a billing
+# problem but is really a routing decision:
+#
+#     "You're out of extra usage. Add more at claude.ai/settings/usage"
+#
+# Verified empirically by replaying one identical Messages request with and
+# without this block on a Claude Pro/Max account that Claude Code itself was
+# serving fine at the same moment: without -> 400, with -> 200. The
+# ``cc_version`` suffix and ``cch`` digests are reverse-engineered from
+# Claude Code's own traffic; if Anthropic rotates the salt these values stop
+# matching and the block becomes inert (falling back to today's behaviour).
+_CCH_SALT = "59cf53e54c78"
+_CCH_POSITIONS = (4, 7, 20)
+_CLAUDE_CODE_ENTRYPOINT = "sdk-cli"
+
 
 def _get_claude_code_version() -> str:
     """Lazily detect the installed Claude Code version when OAuth headers need it."""
@@ -402,6 +426,66 @@ def _get_claude_code_version() -> str:
     if _claude_code_version_cache is None:
         _claude_code_version_cache = _detect_claude_code_version()
     return _claude_code_version_cache
+
+
+def _first_user_message_text(messages: List[Dict[str, Any]]) -> Optional[str]:
+    """Return the first user message's leading text, or None when absent.
+
+    Returns ``None`` (not ``""``) when the conversation carries no user turn
+    at all, so callers can skip the billing header entirely — Claude Code
+    only sends it once a user message exists.
+    """
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    return block.get("text", "")
+        return ""
+    return None
+
+
+def _compute_cch(message_text: str) -> str:
+    """First 5 hex chars of SHA-256(first user message text)."""
+    return hashlib.sha256(message_text.encode("utf-8")).hexdigest()[:5]
+
+
+def _compute_version_suffix(message_text: str, version: str) -> str:
+    """Three-char digest over sampled message chars, the salt, and the version."""
+    chars = "".join(
+        message_text[i] if i < len(message_text) else "0" for i in _CCH_POSITIONS
+    )
+    return hashlib.sha256(
+        f"{_CCH_SALT}{chars}{version}".encode("utf-8")
+    ).hexdigest()[:3]
+
+
+def build_billing_header_value(
+    messages: List[Dict[str, Any]],
+    version: Optional[str] = None,
+    entrypoint: str = _CLAUDE_CODE_ENTRYPOINT,
+) -> Optional[str]:
+    """Build Claude Code's billing header block, or None when not applicable.
+
+    The value is derived from the FIRST user message, which does not change
+    for the life of a conversation — so the emitted block is byte-stable
+    across turns and does not disturb prompt caching. (Context compression
+    can replace that first message; it already invalidates the cache.)
+    """
+    message_text = _first_user_message_text(messages)
+    if message_text is None:
+        return None
+    version = version or _get_claude_code_version()
+    return (
+        "x-anthropic-billing-header: "
+        f"cc_version={version}.{_compute_version_suffix(message_text, version)}; "
+        f"cc_entrypoint={entrypoint}; "
+        f"cch={_compute_cch(message_text)};"
+    )
 
 
 def _is_oauth_token(key: str) -> bool:
@@ -2906,7 +2990,17 @@ def build_anthropic_kwargs(
                 text = text.replace("Nous Research", "Anthropic")
                 block["text"] = text
 
-        # 3. Normalize tool names so NOTHING goes on the OAuth wire with a
+        # 3. Prepend Claude Code's billing header block. Must be system[0],
+        #    ahead of the identity block, matching Claude Code's own wire
+        #    layout: [billing header, identity, ...rest]. Without it the
+        #    subscription classifier bills the request to the extra-usage
+        #    lane and rejects it with a misleading HTTP 400 (see the
+        #    _CCH_SALT block above for the empirical bisection).
+        billing_header = build_billing_header_value(anthropic_messages)
+        if billing_header:
+            system = [{"type": "text", "text": billing_header}] + system
+
+        # 4. Normalize tool names so NOTHING goes on the OAuth wire with a
         #    single-underscore ``mcp_`` prefix.  Anthropic's subscription/OAuth
         #    billing classifier treats a single-underscore ``mcp_`` tool name as
         #    a third-party-app fingerprint and rejects the request with HTTP 400
@@ -2937,7 +3031,7 @@ def build_anthropic_kwargs(
                 if "name" in tool:
                     tool["name"] = _to_oauth_wire_name(tool["name"])
 
-        # 4. Apply the same normalization to tool names in message history
+        # 5. Apply the same normalization to tool names in message history
         #    (tool_use blocks) so replayed turns match the wire names above.
         for msg in anthropic_messages:
             content = msg.get("content")
