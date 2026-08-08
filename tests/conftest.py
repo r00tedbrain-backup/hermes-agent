@@ -580,6 +580,16 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
         lambda *_args, **_kwargs: None,
         raising=False,
     )
+    # The writer needs the same treatment as the reader: credential refresh
+    # mirrors the rotated token pair into the Keychain, so an unguarded test
+    # that exercises _write_claude_code_credentials() would overwrite the
+    # developer's real Claude Code login with fixture tokens.
+    monkeypatch.setattr(
+        _anthropic_adapter,
+        "_write_claude_code_credentials_to_keychain",
+        lambda *_args, **_kwargs: False,
+        raising=False,
+    )
     return None
 
 
