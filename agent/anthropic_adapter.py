@@ -1035,6 +1035,185 @@ def build_anthropic_bedrock_client(region: str):
     )
 
 
+_CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def _read_claude_code_keychain_payload() -> Optional[Tuple[Dict[str, Any], str]]:
+    """Return the Keychain entry's parsed JSON payload and account name.
+
+    Returns ``None`` when the platform is not macOS, the entry does not
+    exist, or its payload is not JSON.  The account name is needed to update
+    the entry in place — ``security add-generic-password`` keys on
+    (service, account), so writing without it would create a duplicate entry
+    that Claude Code does not read.
+    """
+    if platform.system() != "Darwin":
+        return None
+
+    try:
+        payload = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", _CLAUDE_CODE_KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5, stdin=subprocess.DEVNULL,
+        )
+        attributes = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", _CLAUDE_CODE_KEYCHAIN_SERVICE],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.debug("Keychain: security command not available or timed out")
+        return None
+
+    if payload.returncode != 0 or attributes.returncode != 0:
+        return None
+
+    try:
+        data = json.loads(payload.stdout.strip())
+    except json.JSONDecodeError:
+        logger.debug("Keychain: credentials payload is not valid JSON")
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    import re
+
+    match = re.search(r'"acct"<blob>="([^"]*)"', attributes.stdout)
+    return data, (match.group(1) if match else "")
+
+
+def _update_macos_keychain_secret(service: str, account: str, secret: bytes) -> bool:
+    """Update an existing generic-password item through Security.framework.
+
+    The ``security`` CLI's interactive ``-w`` prompt truncates input at 128
+    bytes, while passing the value as an argument exposes OAuth credentials in
+    the process list. SecItemUpdate accepts the complete value in memory and
+    avoids both problems.
+    """
+    if platform.system() != "Darwin" or not account:
+        return False
+
+    import ctypes
+
+    created_refs = []
+    try:
+        core_foundation = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        security = ctypes.CDLL(
+            "/System/Library/Frameworks/Security.framework/Security"
+        )
+
+        core_foundation.CFStringCreateWithCString.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,
+        ]
+        core_foundation.CFStringCreateWithCString.restype = ctypes.c_void_p
+        core_foundation.CFDataCreate.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_long,
+        ]
+        core_foundation.CFDataCreate.restype = ctypes.c_void_p
+        core_foundation.CFDictionaryCreate.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_long,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        core_foundation.CFDictionaryCreate.restype = ctypes.c_void_p
+        core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
+        security.SecItemUpdate.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        security.SecItemUpdate.restype = ctypes.c_int32
+
+        def sec_constant(name: str) -> int:
+            return ctypes.c_void_p.in_dll(security, name).value
+
+        utf8_encoding = 0x08000100
+        service_ref = core_foundation.CFStringCreateWithCString(
+            None, service.encode("utf-8"), utf8_encoding
+        )
+        account_ref = core_foundation.CFStringCreateWithCString(
+            None, account.encode("utf-8"), utf8_encoding
+        )
+        secret_buffer = (ctypes.c_uint8 * len(secret)).from_buffer_copy(secret)
+        secret_ref = core_foundation.CFDataCreate(None, secret_buffer, len(secret))
+        created_refs.extend((service_ref, account_ref, secret_ref))
+        if not all(created_refs):
+            return False
+
+        query_keys = (ctypes.c_void_p * 3)(
+            sec_constant("kSecClass"),
+            sec_constant("kSecAttrService"),
+            sec_constant("kSecAttrAccount"),
+        )
+        query_values = (ctypes.c_void_p * 3)(
+            sec_constant("kSecClassGenericPassword"),
+            service_ref,
+            account_ref,
+        )
+        query = core_foundation.CFDictionaryCreate(
+            None, query_keys, query_values, 3, None, None
+        )
+        update_keys = (ctypes.c_void_p * 1)(sec_constant("kSecValueData"))
+        update_values = (ctypes.c_void_p * 1)(secret_ref)
+        update = core_foundation.CFDictionaryCreate(
+            None, update_keys, update_values, 1, None, None
+        )
+        created_refs.extend((query, update))
+        if not query or not update:
+            return False
+
+        return security.SecItemUpdate(query, update) == 0
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        logger.debug("Keychain: Security.framework update failed: %s", exc)
+        return False
+    finally:
+        release = locals().get("core_foundation")
+        if release is not None:
+            for ref in reversed(created_refs):
+                if ref:
+                    release.CFRelease(ref)
+
+
+def _write_claude_code_credentials_to_keychain(oauth_data: Dict[str, Any]) -> bool:
+    """Mirror refreshed OAuth credentials into Claude Code's Keychain entry.
+
+    Claude Code's refresh tokens are single-use: refreshing rotates the pair
+    and invalidates the old refresh token.  On macOS, Claude Code reads its
+    credentials from the Keychain, so a refresh that only rewrote
+    ``~/.claude/.credentials.json`` left the Keychain holding a refresh token
+    that Anthropic had already invalidated — Claude Code's next refresh then
+    failed with ``invalid_grant`` and forced the user to log in again.
+
+    Updates an entry only when one already exists; it never creates one, so
+    installs that keep credentials in the JSON file are unaffected.  Returns
+    True when the entry was updated.
+    """
+    existing = _read_claude_code_keychain_payload()
+    if existing is None:
+        return False
+    data, account = existing
+
+    # Preserve sibling fields Claude Code stores next to the token pair
+    # (scopes, subscriptionType, ...) — dropping them can invalidate the
+    # credential for Claude Code's own auth check.
+    merged_oauth = dict(data.get("claudeAiOauth") or {})
+    merged_oauth.update(oauth_data)
+    data["claudeAiOauth"] = merged_oauth
+    serialized = json.dumps(data).encode("utf-8")
+
+    if not _update_macos_keychain_secret(
+        _CLAUDE_CODE_KEYCHAIN_SERVICE, account, serialized
+    ):
+        logger.debug("Keychain: updating credentials entry failed")
+        return False
+
+    logger.debug("Keychain: mirrored refreshed Claude Code credentials")
+    return True
+
+
 def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
     """Read Claude Code OAuth credentials from the macOS Keychain.
 
@@ -1054,7 +1233,7 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
         # Read the "Claude Code-credentials" generic password entry
         result = subprocess.run(
             ["security", "find-generic-password",
-             "-s", "Claude Code-credentials",
+             "-s", _CLAUDE_CODE_KEYCHAIN_SERVICE,
              "-w"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
@@ -1300,28 +1479,37 @@ def _write_claude_code_credentials(
     *,
     scopes: Optional[list] = None,
 ) -> None:
-    """Write refreshed credentials back to ~/.claude/.credentials.json.
+    """Write refreshed credentials back to every Claude Code credential store.
 
     The optional *scopes* list (e.g. ``["user:inference", "user:profile", ...]``)
     is persisted so that Claude Code's own auth check recognises the credential
     as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
     in the stored scopes before it will use the token.
+
+    Writes ~/.claude/.credentials.json and mirrors the same pair into the
+    macOS Keychain when Claude Code keeps an entry there.  Both stores must
+    move together: refresh tokens are single-use, so leaving one store
+    holding the rotated-away token breaks whichever client reads it next.
     """
     cred_path = Path.home() / ".claude" / ".credentials.json"
+    oauth_data: Dict[str, Any] = {
+        "accessToken": access_token,
+        "refreshToken": refresh_token,
+        "expiresAt": expires_at_ms,
+    }
+    if scopes is not None:
+        oauth_data["scopes"] = scopes
     try:
         # Read existing file to preserve other fields
         existing = {}
         if cred_path.exists():
             existing = json.loads(cred_path.read_text(encoding="utf-8"))
 
-        oauth_data: Dict[str, Any] = {
-            "accessToken": access_token,
-            "refreshToken": refresh_token,
-            "expiresAt": expires_at_ms,
-        }
-        if scopes is not None:
-            oauth_data["scopes"] = scopes
-        elif "claudeAiOauth" in existing and "scopes" in existing["claudeAiOauth"]:
+        if (
+            scopes is None
+            and "claudeAiOauth" in existing
+            and "scopes" in existing["claudeAiOauth"]
+        ):
             # Preserve previously-stored scopes when the refresh response
             # does not include a scope field.
             oauth_data["scopes"] = existing["claudeAiOauth"]["scopes"]
@@ -1359,6 +1547,16 @@ def _write_claude_code_credentials(
             raise
     except (OSError, IOError) as e:
         logger.debug("Failed to write refreshed credentials: %s", e)
+
+    # Mirror into the Keychain even when the file write failed: on macOS the
+    # Keychain is the store Claude Code actually reads, and the rotated
+    # refresh token must land there or Claude Code's next refresh 400s.
+    # A Keychain problem (locked, no entry, security binary missing) must
+    # never fail a refresh whose token pair is already persisted.
+    try:
+        _write_claude_code_credentials_to_keychain(oauth_data)
+    except Exception as exc:  # noqa: BLE001 — best-effort mirror
+        logger.debug("Keychain: mirroring refreshed credentials failed: %s", exc)
 
 
 def _resolve_claude_code_token_from_credentials(creds: Optional[Dict[str, Any]] = None) -> Optional[str]:
