@@ -1,3 +1,65 @@
+> ## 🔱 Fork: usar Hermes con una suscripción Claude Pro/Max
+>
+> Esto es un fork de [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent).
+> Añade **dos arreglos para poder mover Hermes con una suscripción de Anthropic
+> Claude Pro/Max** — lo mismo que hace [`@ex-machina/opencode-anthropic-auth`](https://github.com/ex-machina-co/opencode-anthropic-auth)
+> en OpenCode — en vez de pagar créditos de API por token.
+>
+> **El problema.** Hermes ya traía de serie todo el flujo OAuth
+> (`hermes auth add anthropic --type oauth`), pero cada petición con la
+> suscripción devolvía un HTTP 400 que parece un error de facturación:
+>
+> ```
+> "You're out of extra usage. Add more at claude.ai/settings/usage"
+> ```
+>
+> No es un error de facturación. Anthropic solo carga una petición a la cuota
+> incluida en tu plan cuando lleva la línea `x-anthropic-billing-header:` de
+> Claude Code como primer bloque de system. Sin ella, la petición se enruta al
+> carril de *extra usage* y se rechaza. Verificado lanzando `claude -p` y
+> Hermes contra la misma cuenta en el mismo minuto — Claude Code devolvía 200 y
+> Hermes 400 — y luego bisecando un replay de la misma petición hasta que una
+> sola variable lo cambiaba todo.
+>
+> | Arreglo | Qué hace |
+> |---|---|
+> | [`a05650194`](https://github.com/r00tedbrain-backup/hermes-agent/commit/a05650194) | Envía el billing header de Claude Code, para que la petición se cargue a la cuota del plan |
+> | [`242127baf`](https://github.com/r00tedbrain-backup/hermes-agent/commit/242127baf) | Sincroniza los tokens renovados con el Keychain de macOS, para que refrescar desde Hermes no te rompa el login de Claude Code |
+>
+> **Instalar este fork** (una sola instalación, vale para todos tus proyectos).
+> Necesitas `git`, Python 3.12+ y [`uv`](https://docs.astral.sh/uv/):
+>
+> ```bash
+> git clone https://github.com/r00tedbrain-backup/hermes-agent ~/.hermes/hermes-agent
+> cd ~/.hermes/hermes-agent
+> git remote add upstream https://github.com/NousResearch/hermes-agent.git
+> uv venv venv --python 3.12
+> uv pip install -e ".[all]" anthropic --python venv/bin/python
+> ln -s ~/.hermes/hermes-agent/venv/bin/hermes ~/.local/bin/hermes
+>
+> hermes auth add anthropic --type oauth   # login por navegador con tu cuenta Pro/Max
+> hermes config set model claude-sonnet-4.6
+> hermes config set model.provider anthropic
+> ```
+>
+> Después basta con hacer `cd` a cualquier proyecto y ejecutar `hermes`. **No**
+> hay que clonar este repo en cada proyecto: una sola instalación sirve para
+> todos, y el `AGENTS.md` de cada proyecto se carga automáticamente. Usa
+> `hermes -p <nombre>` si quieres un perfil con config, memoria y sesiones
+> aisladas.
+>
+> `hermes update` respeta los forks: no sobrescribe estos commits. Para traer
+> cambios de upstream: `git pull upstream main`.
+>
+> ⚠️ **Aviso.** Esto hace que Hermes se presente ante Anthropic como si fuera
+> Claude Code. Es una zona gris respecto a los términos de Anthropic — el
+> plugin de OpenCode en el que se basa lleva el mismo aviso. No lo uses para
+> abusar de tu suscripción, y usa tu criterio.
+>
+> Todo lo que viene debajo es el README original de upstream.
+
+---
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
