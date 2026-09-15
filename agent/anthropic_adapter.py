@@ -1038,6 +1038,36 @@ def build_anthropic_bedrock_client(region: str):
 _CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 
+def _keychain_disabled() -> bool:
+    """Return True when Keychain access for Claude Code credentials is off.
+
+    macOS keys an entry's XARA partition list to the binary that wrote it.
+    Claude Code writes ``Claude Code-credentials`` under its own cdhash, so
+    reads through ``/usr/bin/security`` (which macOS labels ``apple-tool:``)
+    fail the partition check and pop a system password prompt on *every*
+    read.  Worse, ``_write_claude_code_credentials_to_keychain`` rewrites the
+    entry on each token refresh, which resets the partition list — so
+    authorising ``apple-tool:`` by hand only holds until the next refresh
+    (~8h), then the prompt storm returns.
+
+    ``~/.claude/.credentials.json`` carries the same accessToken /
+    refreshToken / expiresAt, so installs that have the file can skip the
+    Keychain entirely.  Opt out with ``claude_code_keychain: false`` under
+    ``model:`` in config.yaml.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+    except Exception:  # config unavailable (tests, early import) — keep default
+        return False
+
+    model_config = config.get("model")
+    if not isinstance(model_config, dict):
+        return False
+    return model_config.get("claude_code_keychain") is False
+
+
 def _read_claude_code_keychain_payload() -> Optional[Tuple[Dict[str, Any], str]]:
     """Return the Keychain entry's parsed JSON payload and account name.
 
@@ -1048,6 +1078,8 @@ def _read_claude_code_keychain_payload() -> Optional[Tuple[Dict[str, Any], str]]
     that Claude Code does not read.
     """
     if platform.system() != "Darwin":
+        return None
+    if _keychain_disabled():
         return None
 
     try:
@@ -1227,6 +1259,8 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
     Returns dict with {accessToken, refreshToken?, expiresAt?} or None.
     """
     if platform.system() != "Darwin":
+        return None
+    if _keychain_disabled():
         return None
 
     try:
