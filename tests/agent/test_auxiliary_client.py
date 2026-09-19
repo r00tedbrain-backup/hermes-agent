@@ -2526,7 +2526,10 @@ class TestAuxiliaryAuthRefreshRetry:
 
 
 
-    def test_refresh_provider_credentials_force_refreshes_anthropic_oauth_and_evicts_cache(self, monkeypatch):
+    def test_refresh_provider_credentials_leaves_claude_codes_token_alone(self, monkeypatch):
+        """Anthropic refresh tokens are single-use — spending Claude Code's
+        one invalidates the copy Claude Code holds, so Hermes must not.
+        """
         stale_client = MagicMock()
         cache_key = ("anthropic", False, None, None, None)
 
@@ -2541,20 +2544,13 @@ class TestAuxiliaryAuthRefreshRetry:
                 "refreshToken": "refresh-token",
                 "expiresAt": 0,
             }),
-            patch("agent.anthropic_adapter.refresh_anthropic_oauth_pure", return_value={
-                "access_token": "fresh-token",
-                "refresh_token": "refresh-token-2",
-                "expires_at_ms": 9999999999999,
-            }) as mock_refresh_oauth,
-            patch("agent.anthropic_adapter._write_claude_code_credentials") as mock_write,
+            patch("agent.anthropic_adapter.refresh_anthropic_oauth_pure") as mock_refresh_oauth,
         ):
             from agent.auxiliary_client import _refresh_provider_credentials
 
-            assert _refresh_provider_credentials("anthropic") is True
+            _refresh_provider_credentials("anthropic")
 
-        mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=False)
-        mock_write.assert_called_once_with("fresh-token", "refresh-token-2", 9999999999999)
-        stale_client.close.assert_called_once()
+        mock_refresh_oauth.assert_not_called()
 
     def test_refresh_provider_credentials_remints_vertex_token_and_evicts_cache(self):
         """Vertex tokens live ~1h; on a long-running gateway the cached
