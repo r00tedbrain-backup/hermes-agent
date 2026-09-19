@@ -362,34 +362,73 @@ _OAUTH_ONLY_BETAS = [
 
 # Claude Code identity — required for OAuth requests to be routed correctly.
 # Without these, Anthropic's infrastructure intermittently 500s OAuth traffic.
-# The version must stay reasonably current — Anthropic rejects OAuth requests
-# when the spoofed user-agent version is too far behind the actual release.
-_CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
+#
+# Anthropic gates model access on the reported version SERVER-SIDE: asking for a
+# model newer than the reported client returns HTTP 400 "Claude Code <version>
+# does not support this model; version <N> or newer is required" (Fable requires
+# 2.1.251).  So this floor is not cosmetic — it is the minimum version that can
+# reach current models, and it must be bumped as Anthropic moves the gate.
+_CLAUDE_CODE_VERSION_FALLBACK = "2.1.258"
 _claude_code_version_cache: Optional[str] = None
 
 
-def _detect_claude_code_version() -> str:
-    """Detect the installed Claude Code version, fall back to a static constant.
+def _version_tuple(version: str) -> Tuple[int, ...]:
+    """Parse ``major.minor.patch`` for ordering; ``()`` when malformed.
 
-    Anthropic's OAuth infrastructure validates the user-agent version and may
-    reject requests with a version that's too old.  Detecting dynamically means
-    users who keep Claude Code updated never hit stale-version 400s.
+    Compared numerically, not lexically — ``2.1.99`` sorts after ``2.1.258`` as
+    a string but is the older release.
     """
-    import subprocess as _sp
+    parts = version.split(".")
+    return tuple(int(p) for p in parts) if all(p.isdigit() for p in parts) else ()
 
-    for cmd in ("claude", "claude-code"):
+
+def _detect_claude_code_version() -> str:
+    """Report a Claude Code version at or above the gate floor.
+
+    Detection keeps us current as users update the CLI, without waiting on a
+    Hermes release.  Two failure modes make the raw result unsafe on its own,
+    and both surface as the same 400:
+
+    * GUI launches (Electron desktop, LaunchAgents) inherit the bare macOS PATH
+      ``/usr/bin:/bin:/usr/sbin:/sbin``, which carries none of the CLI's install
+      prefixes — so a PATH-only lookup finds nothing there even when the CLI is
+      installed.  Hence the explicit prefix probe.
+    * A user whose installed CLI predates the gate would report a version that
+      Anthropic rejects.
+
+    So never report below ``_CLAUDE_CODE_VERSION_FALLBACK``: the floor already
+    satisfies the gate, and a newer detected version is only ever an upgrade.
+    """
+    import shutil
+
+    home = os.path.expanduser("~")
+    prefixes = (
+        f"{home}/.local/bin", f"{home}/.claude/local", f"{home}/bin",
+        "/opt/homebrew/bin", "/usr/local/bin",
+        f"{home}/.npm-global/bin", f"{home}/.bun/bin", f"{home}/.volta/bin",
+    )
+    floor = _version_tuple(_CLAUDE_CODE_VERSION_FALLBACK)
+    # dict.fromkeys dedupes while preserving probe order — PATH hit first.
+    candidates = dict.fromkeys(
+        cmd
+        for name in ("claude", "claude-code")
+        for cmd in (shutil.which(name), *(f"{p}/{name}" for p in prefixes))
+        if cmd and os.path.isfile(cmd)
+    )
+    for cmd in candidates:
         try:
-            result = _sp.run(
+            result = subprocess.run(
                 [cmd, "--version"],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
             )
-            if result.returncode == 0 and result.stdout.strip():
-                # Output is like "2.1.74 (Claude Code)" or just "2.1.74"
-                version = result.stdout.strip().split()[0]
-                if version and version[0].isdigit():
-                    return version
         except Exception:
-            pass
+            continue
+        if result.returncode != 0:
+            continue
+        # Output is like "2.1.276 (Claude Code)" or just "2.1.276"
+        version = result.stdout.strip().split(" ")[0]
+        if _version_tuple(version) > floor:
+            return version
     return _CLAUDE_CODE_VERSION_FALLBACK
 
 
