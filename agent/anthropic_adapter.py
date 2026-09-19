@@ -1636,6 +1636,33 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     return None
 
 
+def _claude_code_source_suppressed() -> bool:
+    """True when the user removed Hermes' Claude Code credential.
+
+    ``hermes auth remove anthropic <claude_code entry>`` records a
+    suppression so Hermes stops reading Claude Code's credential store —
+    the removal step deliberately leaves that store intact so the user's
+    Claude Code install keeps working.
+
+    The credential pool honours that suppression when it re-seeds, but this
+    resolver used to read Claude Code's store directly at step 4, ahead of
+    the pool, with no suppression check. The removal therefore looked like
+    it had worked and changed nothing: Hermes kept authenticating as
+    whichever Anthropic account Claude Code was logged into, and there was
+    no way to point it at a different one.
+
+    Fails open — an unreadable auth store must not strip a working
+    credential source.
+    """
+    try:
+        from hermes_cli.auth import is_source_suppressed
+
+        return is_source_suppressed("anthropic", "claude_code")
+    except Exception:
+        logger.debug("Could not read claude_code suppression state", exc_info=True)
+        return False
+
+
 def resolve_anthropic_token() -> Optional[str]:
     """Resolve an Anthropic token from all available sources.
 
@@ -1651,9 +1678,12 @@ def resolve_anthropic_token() -> Optional[str]:
     """
     creds: Optional[Dict[str, Any]] = None
     creds_loaded = False
+    claude_code_suppressed = _claude_code_source_suppressed()
 
     def _read_creds() -> Optional[Dict[str, Any]]:
         nonlocal creds, creds_loaded
+        if claude_code_suppressed:
+            return None
         if not creds_loaded:
             creds = read_claude_code_credentials()
             creds_loaded = True
@@ -1681,10 +1711,14 @@ def resolve_anthropic_token() -> Optional[str]:
     if api_key:
         return api_key
 
-    # 4. Claude Code credential file
-    resolved_claude_token = _resolve_claude_code_token_from_credentials(_read_creds())
-    if resolved_claude_token:
-        return resolved_claude_token
+    # 4. Claude Code credential file — skipped once the user has removed it.
+    #    ``_resolve_claude_code_token_from_credentials`` re-reads the live
+    #    stores when handed None, so the guard has to be explicit here; a
+    #    suppressed ``_read_creds()`` alone would not stop it.
+    if not claude_code_suppressed:
+        resolved_claude_token = _resolve_claude_code_token_from_credentials(_read_creds())
+        if resolved_claude_token:
+            return resolved_claude_token
 
     # 5. Hermes credential_pool OAuth entry.
     resolved_pool_token = _resolve_anthropic_pool_token()
