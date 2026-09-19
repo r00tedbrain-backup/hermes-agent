@@ -1352,6 +1352,22 @@ class CredentialPool:
             if self.provider == "anthropic":
                 from agent.anthropic_adapter import refresh_anthropic_oauth_pure
 
+                if entry.source == "claude_code":
+                    # Anthropic's refresh tokens are single-use. Spending this
+                    # one rotates the pair and invalidates the copy Claude Code
+                    # still holds, breaking `claude` until the user logs in
+                    # again — and Hermes cannot repair that without writing
+                    # another application's credential store. Leave it alone
+                    # and let the pool fall through to a Hermes-owned
+                    # credential.
+                    logger.info(
+                        "anthropic: not refreshing the Claude Code credential "
+                        "(single-use token shared with Claude Code). Run `claude` "
+                        "to refresh it, or add a Hermes credential with "
+                        "`hermes auth add anthropic --type oauth`."
+                    )
+                    return None
+
                 refreshed = refresh_anthropic_oauth_pure(
                     entry.refresh_token,
                     use_json=entry.source.endswith("hermes_pkce"),
@@ -1362,19 +1378,6 @@ class CredentialPool:
                     refresh_token=refreshed["refresh_token"],
                     expires_at_ms=refreshed["expires_at_ms"],
                 )
-                # Keep ~/.claude/.credentials.json in sync so that the
-                # fallback path (resolve_anthropic_token) and other profiles
-                # see the latest tokens.
-                if entry.source == "claude_code":
-                    try:
-                        from agent.anthropic_adapter import _write_claude_code_credentials
-                        _write_claude_code_credentials(
-                            refreshed["access_token"],
-                            refreshed["refresh_token"],
-                            refreshed["expires_at_ms"],
-                        )
-                    except Exception as wexc:
-                        logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
             elif self.provider == "openai-codex":
                 # Adopt fresher tokens from auth.json before spending the
                 # refresh_token — single-use tokens consumed by another Hermes
@@ -1448,15 +1451,6 @@ class CredentialPool:
                         )
                         self._replace_entry(synced, updated)
                         self._persist()
-                        try:
-                            from agent.anthropic_adapter import _write_claude_code_credentials
-                            _write_claude_code_credentials(
-                                refreshed["access_token"],
-                                refreshed["refresh_token"],
-                                refreshed["expires_at_ms"],
-                            )
-                        except Exception as wexc:
-                            logger.debug("Failed to write refreshed token to credentials file (retry path): %s", wexc)
                         return updated
                     except Exception as retry_exc:
                         logger.debug("Retry refresh also failed: %s", retry_exc)

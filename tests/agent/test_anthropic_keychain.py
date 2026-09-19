@@ -227,35 +227,24 @@ class TestRefreshOAuthTokenAdoptsFreshCredential:
         result = _refresh_oauth_token({"refreshToken": "stale", "expiresAt": 1})
         assert result == "already-refreshed-token"
 
-    def test_falls_back_to_network_refresh_when_no_fresh_credential(self, monkeypatch):
-        """When no live source has a valid token, fall back to refreshing
-        ourselves using the freshest available refresh token.
+    def test_gives_up_instead_of_spending_claude_codes_refresh_token(self, monkeypatch):
+        """No live source has a valid token — Hermes must NOT refresh.
+
+        Anthropic's refresh tokens are single-use. Spending Claude Code's
+        rotates the pair and invalidates the copy Claude Code still holds, so
+        the next `claude` run fails with invalid_grant and forces a re-login.
+        Resolution falls through to a Hermes-owned credential instead.
         """
-        # Live read returns an expired credential carrying a refresh token.
         monkeypatch.setattr(
             "agent.anthropic_adapter.read_claude_code_credentials",
             lambda: {"accessToken": "expired", "refreshToken": "live-refresh", "expiresAt": 1},
         )
-        captured = {}
 
-        def _fake_refresh(refresh_token, **kwargs):
-            captured["refresh_token"] = refresh_token
-            return {
-                "access_token": "newly-minted",
-                "refresh_token": "rotated",
-                "expires_at_ms": self._FRESH,
-            }
+        def _must_not_run(*_args, **_kwargs):
+            raise AssertionError("Hermes rotated Claude Code's refresh token")
 
         monkeypatch.setattr(
-            "agent.anthropic_adapter.refresh_anthropic_oauth_pure", _fake_refresh
-        )
-        monkeypatch.setattr(
-            "agent.anthropic_adapter._write_claude_code_credentials",
-            lambda *a, **k: None,
+            "agent.anthropic_adapter.refresh_anthropic_oauth_pure", _must_not_run
         )
 
-        result = _refresh_oauth_token({"refreshToken": "caller-refresh", "expiresAt": 1})
-        assert result == "newly-minted"
-        # Prefers the live source's refresh token over the caller's stale copy.
-        assert captured["refresh_token"] == "live-refresh"
-
+        assert _refresh_oauth_token({"refreshToken": "caller-refresh", "expiresAt": 1}) is None

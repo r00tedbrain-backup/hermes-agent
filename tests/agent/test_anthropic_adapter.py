@@ -14,7 +14,6 @@ from agent.anthropic_adapter import (
     _is_oauth_token,
     _refresh_oauth_token,
     _to_plain_data,
-    _write_claude_code_credentials,
     build_anthropic_client,
     build_anthropic_bedrock_client,
     build_anthropic_kwargs,
@@ -386,96 +385,34 @@ class TestRefreshOauthToken:
         creds = {"accessToken": "expired", "refreshToken": "", "expiresAt": 0}
         assert _refresh_oauth_token(creds) is None
 
-    def test_successful_refresh(self, tmp_path, monkeypatch):
+    def test_never_spends_claude_codes_refresh_token(self, tmp_path, monkeypatch):
+        """Refresh tokens are single-use: spending Claude Code's breaks Claude Code."""
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         monkeypatch.setattr(
             "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
         )
-
         creds = {
             "accessToken": "old-token",
             "refreshToken": "refresh-123",
             "expiresAt": int(time.time() * 1000) - 3600_000,
         }
 
-        mock_response = json.dumps({
-            "access_token": "new-token-abc",
-            "refresh_token": "new-refresh-456",
-            "expires_in": 7200,
-        }).encode()
-
         with patch("urllib.request.urlopen") as mock_urlopen:
-            mock_ctx = MagicMock()
-            mock_ctx.__enter__ = MagicMock(return_value=MagicMock(
-                read=MagicMock(return_value=mock_response)
-            ))
-            mock_ctx.__exit__ = MagicMock(return_value=False)
-            mock_urlopen.return_value = mock_ctx
+            assert _refresh_oauth_token(creds) is None
 
-            result = _refresh_oauth_token(creds)
+        mock_urlopen.assert_not_called()
 
-        assert result == "new-token-abc"
-        # Verify credentials were written back
-        cred_file = tmp_path / ".claude" / ".credentials.json"
-        assert cred_file.exists()
-        written = json.loads(cred_file.read_text())
-        assert written["claudeAiOauth"]["accessToken"] == "new-token-abc"
-        assert written["claudeAiOauth"]["refreshToken"] == "new-refresh-456"
-
-    def test_failed_refresh_returns_none(self, tmp_path, monkeypatch):
+    def test_writes_nothing_to_claude_codes_credential_file(self, tmp_path, monkeypatch):
+        """Hermes must not create or rewrite another application's store."""
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         monkeypatch.setattr(
             "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
         )
-        creds = {
-            "accessToken": "old",
-            "refreshToken": "refresh-123",
-            "expiresAt": 0,
-        }
+        creds = {"accessToken": "old", "refreshToken": "r", "expiresAt": 0}
 
-        with patch("urllib.request.urlopen", side_effect=Exception("network error")):
-            assert _refresh_oauth_token(creds) is None
+        _refresh_oauth_token(creds)
 
-
-class TestWriteClaudeCodeCredentials:
-    def test_writes_new_file(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        _write_claude_code_credentials("tok", "ref", 12345)
-        cred_file = tmp_path / ".claude" / ".credentials.json"
-        assert cred_file.exists()
-        data = json.loads(cred_file.read_text())
-        assert data["claudeAiOauth"]["accessToken"] == "tok"
-        assert data["claudeAiOauth"]["refreshToken"] == "ref"
-        assert data["claudeAiOauth"]["expiresAt"] == 12345
-
-    def test_preserves_existing_fields(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        cred_dir = tmp_path / ".claude"
-        cred_dir.mkdir()
-        cred_file = cred_dir / ".credentials.json"
-        cred_file.write_text(json.dumps({"otherField": "keep-me"}))
-        _write_claude_code_credentials("new-tok", "new-ref", 99999)
-        data = json.loads(cred_file.read_text())
-        assert data["otherField"] == "keep-me"
-        assert data["claudeAiOauth"]["accessToken"] == "new-tok"
-
-    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
-    def test_credentials_file_created_with_0o600(self, tmp_path, monkeypatch):
-        """Refreshed Claude Code credentials must land on disk at 0o600.
-
-        Regression for the TOCTOU race where ``write_text`` + ``replace``
-        + post-write ``chmod`` left both the temp file and the destination
-        briefly readable at the process umask (commonly 0o644). Mirrors
-        the fix shipped in #19673 (google_oauth) and #21148 (mcp_oauth).
-        """
-        import stat as _stat
-        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        _write_claude_code_credentials("tok", "ref", 12345)
-
-        cred_file = tmp_path / ".claude" / ".credentials.json"
-        assert cred_file.exists()
-        mode = _stat.S_IMODE(cred_file.stat().st_mode)
-        assert mode == 0o600, f"creds file mode {oct(mode)} != 0o600 — TOCTOU race regressed"
+        assert not (tmp_path / ".claude" / ".credentials.json").exists()
 
 
 class TestResolveWithRefresh:
