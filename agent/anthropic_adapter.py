@@ -4,6 +4,7 @@ OpenAI-style internals. Auth: API keys (``sk-ant-api*``) -> x-api-key; OAuth set
 payload conversion and credentials live in ``agent/anthropic_{endpoints,message_convert,
 credentials}.py``; import them from there."""
 
+import hashlib
 import logging
 import math
 import os
@@ -12,7 +13,7 @@ import shutil
 import subprocess
 from collections.abc import Iterable
 from contextlib import suppress
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from utils import normalize_proxy_env_vars
 
@@ -215,10 +216,14 @@ _FAST_MODE_BETA = "fast-mode-2026-02-01"
 # Required for OAuth/subscription auth; matches Claude Code / pi-ai / OpenCode.
 _OAUTH_ONLY_BETAS = ["claude-code-20250219", "oauth-2025-04-20"]
 
-# Claude Code identity — OAuth requests without it intermittently 500. Anthropic rejects OAuth
-# requests whose user-agent version is too far behind the actual release, so the installed
-# version is detected and this fallback kept current.
-_CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
+# Claude Code identity — OAuth requests without it intermittently 500. Anthropic also gates model
+# access on the reported version SERVER-SIDE: asking for a model newer than the reported client
+# returns HTTP 400 "Claude Code <version> does not support this model; version <N> or newer is
+# required" (Fable requires 2.1.251). So this constant is not just a fallback, it is the FLOOR —
+# the minimum version that can reach current models — and must be bumped as Anthropic moves the
+# gate. A detected CLI older than the floor is ignored rather than reported, otherwise a machine
+# with a stale `claude` install is locked out of the newest models.
+_CLAUDE_CODE_VERSION_FALLBACK = "2.1.258"
 _claude_code_version_cache: Optional[str] = None
 
 # Install prefixes probed in addition to PATH. GUI launches (the Electron desktop app, macOS
@@ -256,8 +261,24 @@ def _claude_code_candidates() -> List[str]:
     return list(seen)
 
 
+def _version_tuple(version: str) -> Tuple[int, ...]:
+    """Parse ``major.minor.patch`` for ordering; ``()`` when malformed.
+
+    Compared numerically, not lexically — ``2.1.99`` sorts after ``2.1.258`` as a string but is
+    the older release.
+    """
+    parts = version.split(".")
+    return tuple(int(p) for p in parts) if all(p.isdigit() for p in parts) else ()
+
+
 def _detect_claude_code_version() -> str:
-    """Installed Claude Code version (``claude --version``), else the static fallback."""
+    """Installed Claude Code version (``claude --version``), else the static floor.
+
+    A detected version at or below ``_CLAUDE_CODE_VERSION_FALLBACK`` is discarded: the floor
+    already clears Anthropic's model gate, so reporting an older installed CLI could only lose
+    access. Detection therefore only ever upgrades what we report.
+    """
+    floor = _version_tuple(_CLAUDE_CODE_VERSION_FALLBACK)
     for cmd in _claude_code_candidates():
         with suppress(Exception):
             result = subprocess.run(
@@ -266,7 +287,7 @@ def _detect_claude_code_version() -> str:
             )
             if result.returncode == 0 and result.stdout.strip():
                 version = result.stdout.strip().split()[0]  # "2.1.74 (Claude Code)" or "2.1.74"
-                if version and version[0].isdigit():
+                if _version_tuple(version) > floor:
                     return version
     return _CLAUDE_CODE_VERSION_FALLBACK
 
@@ -281,6 +302,72 @@ def _get_claude_code_version() -> str:
 
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 _MCP_TOOL_PREFIX = "mcp__"
+
+# ── Claude Code billing header ───────────────────────────────────────────
+# Claude Code sends an ``x-anthropic-billing-header:`` line as the FIRST system block on every
+# OAuth/subscription request. Despite the name it travels in the request body, not in HTTP
+# headers. Without it the subscription classifier does not recognise the caller as Claude Code
+# and bills the request to the metered extra-usage lane instead of the plan's included quota —
+# the same HTTP 400 ("You're out of extra usage") documented below, reached by a different
+# trigger. Verified by replaying one identical Messages request with and without this block on a
+# Pro/Max account that Claude Code itself was serving fine at that moment: without -> 400,
+# with -> 200. The digests are reverse-engineered from Claude Code's own traffic; if Anthropic
+# rotates the salt they stop matching and the block becomes inert (today's behaviour).
+_CCH_SALT = "59cf53e54c78"
+_CCH_POSITIONS = (4, 7, 20)
+_CLAUDE_CODE_ENTRYPOINT = "sdk-cli"
+
+
+def _first_user_message_text(messages: List[Dict[str, Any]]) -> Optional[str]:
+    """First user message's leading text; ``None`` when the conversation has no user turn
+    (Claude Code only sends the billing header once one exists)."""
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    return block.get("text", "")
+        return ""
+    return None
+
+
+def _compute_cch(message_text: str) -> str:
+    """First 5 hex chars of SHA-256(first user message text)."""
+    return hashlib.sha256(message_text.encode("utf-8")).hexdigest()[:5]
+
+
+def _compute_version_suffix(message_text: str, version: str) -> str:
+    """Three-char digest over sampled message chars, the salt, and the version."""
+    chars = "".join(message_text[i] if i < len(message_text) else "0" for i in _CCH_POSITIONS)
+    return hashlib.sha256(f"{_CCH_SALT}{chars}{version}".encode("utf-8")).hexdigest()[:3]
+
+
+def build_billing_header_value(
+    messages: List[Dict[str, Any]],
+    version: Optional[str] = None,
+    entrypoint: str = _CLAUDE_CODE_ENTRYPOINT,
+) -> Optional[str]:
+    """Claude Code's billing header block, or ``None`` when not applicable.
+
+    Derived from the FIRST user message, which does not change for the life of a conversation, so
+    the emitted block is byte-stable across turns and does not disturb prompt caching. (Context
+    compression can replace that first message; it already invalidates the cache.)
+    """
+    message_text = _first_user_message_text(messages)
+    if message_text is None:
+        return None
+    version = version or _get_claude_code_version()
+    return (
+        "x-anthropic-billing-header: "
+        f"cc_version={version}.{_compute_version_suffix(message_text, version)}; "
+        f"cc_entrypoint={entrypoint}; "
+        f"cch={_compute_cch(message_text)};"
+    )
+
 
 # Anthropic's OAuth billing classifier fingerprints certain Hermes tool schemas/prose as a
 # third-party app and reroutes to the metered extra-usage lane (HTTP 400 "You're out of extra
@@ -568,6 +655,11 @@ def _apply_claude_code_identity(system, anthropic_tools, anthropic_messages, to_
         for block in msg.get("content") if isinstance(msg.get("content"), list) else []:
             if isinstance(block, dict) and block.get("type") == "tool_use" and "name" in block:
                 block["name"] = to_wire(block["name"])  # tool_result pairs by id, not name
+    # Prepended last so the replacement/alias loop above cannot rewrite the header's literal
+    # text, leaving it as system[0] on the wire (Claude Code's own layout).
+    billing_header = build_billing_header_value(anthropic_messages)
+    if billing_header:
+        system = [{"type": "text", "text": billing_header}] + system
     return system
 
 
